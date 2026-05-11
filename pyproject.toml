@@ -1,0 +1,15 @@
+[project]
+name = "ckid-u25"
+version = "0.1.0"
+description = "CKiD U25 eGFR (Pierce 2021): Python reference implementation and T-SQL renderer."
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.12,<0.12.0"]
+build-backend = "uv_build"

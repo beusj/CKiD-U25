@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(command -v uv)",
+      "Bash(command -v R)",
+      "Bash(command -v Rscript)",
+      "Bash(command -v python3)",
+      "Bash(command -v brew)",
+      "Bash(command -v pip3)",
+      "Bash(command -v pipx)",
+      "Read(//Users/jonathanbeus/.local/bin/**)",
+      "Read(//Users/jonathanbeus/.cargo/bin/**)",
+      "Bash(~/.local/bin/uv --version)",
+      "Bash(~/.local/bin/uv python *)",
+      "Bash(~/.local/bin/uv sync *)",
+      "Bash(~/.local/bin/uv run *)",
+      "Bash('~/.local/bin/uv' run python -c ' *)"
+    ]
+  }
+}
