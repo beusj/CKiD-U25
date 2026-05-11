@@ -137,9 +137,9 @@ Expected output:
 
 ## Installation and dependencies
 
-**Runtime:** no external dependencies (pure Python stdlib).
+**Runtime:** no external dependencies — pure Python stdlib.
 
-**Development:**
+**Development setup:**
 
 ```bash
 # Install uv if you don't have it
@@ -162,13 +162,64 @@ uv export --no-dev --format requirements-txt > requirements.txt      # runtime o
 uv export --format requirements-txt > requirements-dev.txt           # + dev deps
 ```
 
-**Optional extras** (not included by default):
+**Optional extras** (declared in `pyproject.toml`, not installed by default):
 
-| Extra | Install | Purpose |
+| Extra | Install command | Unlocks |
 |---|---|---|
-| SQL Server validation | `uv add pyodbc` | `run_harness()` against live SQL Server |
-| DataFrame output | `uv add pandas` | `to_dataframe()` in `validate.py` |
-| kidney.epi cross-validation | Install R, then `uv add rpy2` | Activates 20 rpy2 comparison tests in `tests/test_python_impl.py` that skip otherwise |
+| `sqlserver` | `uv sync --extra sqlserver` | `run_harness()` against SQL Server via pyodbc or SQLAlchemy |
+| `rpy2` | Install R first, then `uv sync --extra rpy2` | 20 kidney.epi comparison tests in `tests/test_python_impl.py` |
+| `all` | `uv sync --all-extras` | Everything above |
+| pandas (ad-hoc) | `uv add pandas` | `to_dataframe()` in `validate.py` |
+
+The `sqlserver` extra installs **both** `pyodbc` and `sqlalchemy[mssql]` — `run_harness()`
+accepts either connection type (see SQL Server section below).
+
+---
+
+## SQL Server connection (pyodbc or SQLAlchemy)
+
+Install the `sqlserver` extra, which provides both pyodbc and SQLAlchemy:
+
+```bash
+uv sync --extra sqlserver
+```
+
+**pyodbc** — direct DBAPI-2 connection:
+
+```python
+import pyodbc
+from ckid_u25.validate import run_harness, print_harness_report
+
+conn = pyodbc.connect(
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=myserver.database.windows.net;"
+    "DATABASE=research_db;"
+    "Trusted_Connection=yes;"
+)
+results = run_harness(conn)
+print_harness_report(results)
+conn.close()
+```
+
+**SQLAlchemy** — pass the connection from `engine.connect()` or `engine.begin()`:
+
+```python
+from sqlalchemy import create_engine
+from ckid_u25.validate import run_harness, print_harness_report
+
+engine = create_engine(
+    "mssql+pyodbc://myserver/research_db"
+    "?driver=ODBC+Driver+18+for+SQL+Server&trusted_connection=yes"
+)
+
+with engine.connect() as conn:
+    results = run_harness(conn)
+
+print_harness_report(results)
+```
+
+> The harness creates `#ckid_u25_test_vectors` as a local SQL Server temp table
+> and drops it after the run. It does not persist anything in your database.
 
 ---
 

@@ -5,6 +5,23 @@ description = "CKiD U25 eGFR (Pierce 2021): Python reference implementation and 
 requires-python = ">=3.14"
 dependencies = []
 
+[project.optional-dependencies]
+# SQL Server connectivity — install either or both; validate.py accepts both
+sqlserver = [
+    "pyodbc>=5",
+    "sqlalchemy[mssql]>=2",
+]
+# kidney.epi cross-validation — requires R + kidney.epi to be installed first
+rpy2 = [
+    "rpy2>=3.5",
+]
+# Convenience: everything at once
+all = [
+    "pyodbc>=5",
+    "sqlalchemy[mssql]>=2",
+    "rpy2>=3.5",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",

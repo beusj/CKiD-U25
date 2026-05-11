@@ -16,16 +16,33 @@ sqlite3.Connection
     ``ckid_u25_test_vectors`` table and registers a ``POWER(b, e)`` scalar
     function automatically.
 
-pyodbc.Connection  (optional, requires ``pip install pyodbc``)
-    Pass a live connection to SQL Server (or any ODBC target with T-SQL
-    syntax).  The harness creates ``#ckid_u25_test_vectors`` as a temp table.
+pyodbc.Connection  (install: ``uv sync --extra sqlserver``)
+    Pass a live DBAPI-2 connection to SQL Server.  The harness creates
+    ``#ckid_u25_test_vectors`` as a local temp table.
 
-Usage (offline — no SQL Server needed)
----------------------------------------
+sqlalchemy.engine.Connection  (install: ``uv sync --extra sqlserver``)
+    Pass a SQLAlchemy connection from ``engine.connect()`` or inside a
+    ``with engine.begin() as conn:`` block.  Both Core and legacy connection
+    styles are supported.
+
+Usage
+-----
+>>> # Offline — no SQL Server needed
 >>> import sqlite3
 >>> from ckid_u25.validate import run_harness, print_harness_report
 >>> results = run_harness(sqlite3.connect(":memory:"))
 >>> print_harness_report(results)
+
+>>> # pyodbc
+>>> import pyodbc
+>>> conn = pyodbc.connect("DRIVER={ODBC Driver 18 for SQL Server};SERVER=...;DATABASE=...;Trusted_Connection=yes")
+>>> results = run_harness(conn)
+
+>>> # SQLAlchemy
+>>> from sqlalchemy import create_engine
+>>> engine = create_engine("mssql+pyodbc://server/database?driver=ODBC+Driver+18+for+SQL+Server&trusted_connection=yes")
+>>> with engine.connect() as conn:
+...     results = run_harness(conn)
 """
 
 from __future__ import annotations
@@ -35,10 +52,9 @@ import sqlite3
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from .coefficients import AGE_MAX, AGE_MIN
 from .python_impl import egfr_cr, egfr_cys
 from .sql_render import render_tsql_cte
-from .test_vectors import ABS_TOLERANCE, TEST_VECTORS, TestVector
+from .test_vectors import ABS_TOLERANCE, TEST_VECTORS
 
 # ---- Public result type --------------------------------------------------- #
 
@@ -61,6 +77,147 @@ class HarnessRow:
     status: str  # "PASS" or "FAIL"
 
 
+# ---- Connection-type detection -------------------------------------------- #
+
+
+def _is_sqlite(conn: Any) -> bool:
+    return isinstance(conn, sqlite3.Connection)
+
+
+def _is_sqlalchemy(conn: Any) -> bool:
+    # Duck-type: SQLAlchemy connections expose .dialect; avoid hard import.
+    return not _is_sqlite(conn) and hasattr(conn, "dialect") and hasattr(conn, "execute")
+
+
+def _translate_to_sqlite(sql: str) -> str:
+    """T-SQL → sqlite shim: LEFT(x, n) → SUBSTR(x, 1, n)."""
+    return re.sub(r"LEFT\(([^,]+),\s*(\d+)\)", r"SUBSTR(\1, 1, \2)", sql)
+
+
+# ---- Thin adapter layer --------------------------------------------------- #
+# Each adapter exposes: execute(sql), executemany(sql, rows), fetchall(), commit(), drop(table)
+
+class _SqliteAdapter:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        conn.create_function("POWER", 2, lambda b, e: b ** e)
+        self._conn = conn
+        self._last: Any = None
+
+    def execute(self, sql: str) -> "_SqliteAdapter":
+        self._last = self._conn.execute(_translate_to_sqlite(sql))
+        return self
+
+    def executemany(self, sql: str, rows: list) -> None:
+        self._conn.executemany(sql, rows)
+
+    def fetchall(self) -> list:
+        return self._last.fetchall()
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def drop(self, table: str) -> None:
+        try:
+            self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _PyodbcAdapter:
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+        self._cur = conn.cursor()
+        self._last: Any = None
+
+    def execute(self, sql: str) -> "_PyodbcAdapter":
+        self._cur.execute(sql)
+        self._last = self._cur
+        return self
+
+    def executemany(self, sql: str, rows: list) -> None:
+        self._cur.executemany(sql, rows)
+
+    def fetchall(self) -> list:
+        return self._last.fetchall()
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def drop(self, table: str) -> None:
+        try:
+            self._cur.execute(
+                f"IF OBJECT_ID('tempdb..{table}') IS NOT NULL DROP TABLE {table}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _SqlAlchemyAdapter:
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+        self._last: Any = None
+
+    def execute(self, sql: str) -> "_SqlAlchemyAdapter":
+        try:
+            from sqlalchemy import text  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError("sqlalchemy is not installed; run `uv sync --extra sqlserver`") from exc
+        self._last = self._conn.execute(text(sql))
+        return self
+
+    def executemany(self, sql: str, rows: list) -> None:
+        # SQLAlchemy text() uses :param style; build individual INSERT statements
+        # using safe literal formatting (all values are internal test fixtures).
+        try:
+            from sqlalchemy import text  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError("sqlalchemy is not installed; run `uv sync --extra sqlserver`") from exc
+        for row in rows:
+            values = ", ".join(
+                "NULL" if v is None else f"'{v}'" if isinstance(v, str) else str(v)
+                for v in row
+            )
+            tbl = sql.split("INTO ")[1].split(" ")[0]
+            self._conn.execute(text(f"INSERT INTO {tbl} VALUES ({values})"))
+
+    def fetchall(self) -> list:
+        return list(self._last.fetchall())
+
+    def commit(self) -> None:
+        # SQLAlchemy autocommit / engine.begin() handles this; explicit commit is a no-op here.
+        try:
+            self._conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def drop(self, table: str) -> None:
+        try:
+            from sqlalchemy import text  # type: ignore[import-not-found]
+            self._conn.execute(
+                text(f"IF OBJECT_ID('tempdb..{table}') IS NOT NULL DROP TABLE {table}")
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _adapter(conn: Any) -> Any:
+    if _is_sqlite(conn):
+        return _SqliteAdapter(conn)
+    if _is_sqlalchemy(conn):
+        return _SqlAlchemyAdapter(conn)
+    return _PyodbcAdapter(conn)
+
+
+# ---- Table name selection ------------------------------------------------- #
+
+_TABLE = "ckid_u25_test_vectors"       # sqlite / local
+_TEMP_TABLE = "#ckid_u25_test_vectors"  # SQL Server temp table
+
+
+def _table_name(conn: Any) -> str:
+    return _TABLE if _is_sqlite(conn) else _TEMP_TABLE
+
+
 # ---- Internal helpers ----------------------------------------------------- #
 
 
@@ -70,110 +227,50 @@ def _approx(actual: float | None, expected: float | None) -> bool:
     return actual is not None and abs(actual - expected) <= ABS_TOLERANCE
 
 
-def _is_sqlite(conn: Any) -> bool:
-    return isinstance(conn, sqlite3.Connection)
-
-
-def _translate_to_sqlite(sql: str) -> str:
-    """Light T-SQL → sqlite shim: LEFT(x, n) → SUBSTR(x, 1, n)."""
-    return re.sub(r"LEFT\(([^,]+),\s*(\d+)\)", r"SUBSTR(\1, 1, \2)", sql)
-
-
-# ---- Table setup ---------------------------------------------------------- #
-
-_TABLE = "ckid_u25_test_vectors"
-_TEMP_TABLE = "#ckid_u25_test_vectors"  # SQL Server temp table
-
-
-def _create_and_populate(conn: Any, table: str) -> None:
-    # Use conn.execute() shorthand for sqlite3 (avoids cursor-level transaction
-    # isolation subtleties in Python 3.12+); use a cursor for pyodbc/DBAPI-only.
-    if _is_sqlite(conn):
-        conn.execute(f"""
-            CREATE TABLE {table} (
-                patient_id INTEGER,
-                lab_date   TEXT,
-                age_yr     REAL,
-                sex        TEXT,
-                height_cm  REAL,
-                scr_mgdl   REAL,
-                cysc_mgl   REAL
-            )
-        """)
-        conn.executemany(
-            f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [(v.test_id, "2026-01-01", v.age_yr, v.sex,
-              v.height_cm, v.scr_mgdl, v.cysc_mgl) for v in TEST_VECTORS],
-        )
-        conn.commit()
-    else:
-        cur = conn.cursor()
-        cur.execute(f"""
-            CREATE TABLE {table} (
-                patient_id INTEGER,
-                lab_date   TEXT,
-                age_yr     REAL,
-                sex        TEXT,
-                height_cm  REAL,
-                scr_mgdl   REAL,
-                cysc_mgl   REAL
-            )
-        """)
-        cur.executemany(
-            f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [(v.test_id, "2026-01-01", v.age_yr, v.sex,
-              v.height_cm, v.scr_mgdl, v.cysc_mgl) for v in TEST_VECTORS],
-        )
-        conn.commit()
-
-
-def _fetch_results(conn: Any, table: str) -> dict[int, tuple]:
-    """Execute the rendered query and return rows keyed by test_id."""
-    if _is_sqlite(conn):
-        conn.create_function("POWER", 2, lambda b, e: b ** e)
-        sql = _translate_to_sqlite(
-            render_tsql_cte(source=table, egfr_threshold=None)
-        ).rstrip().rstrip(";")
-        rows = conn.execute(sql).fetchall()
-    else:
-        sql = render_tsql_cte(source=table, egfr_threshold=None).rstrip().rstrip(";")
-        cur = conn.cursor()
-        cur.execute(sql)
-        rows = cur.fetchall()
-    return {row[0]: row for row in rows}
-
-
 # ---- Public API ----------------------------------------------------------- #
 
 
 def run_harness(conn: Any) -> list[HarnessRow]:
-    """Run the 20-vector harness and return per-row results.
+    """Run the 20-vector harness against both Python impl and SQL.
 
-    Creates a temporary table in the connected database, inserts the 20
-    reference vectors, executes the rendered SQL query, then compares both
-    the Python and SQL outputs to the frozen expected values.
+    Creates a temporary table, inserts the 20 reference vectors, executes the
+    rendered SQL query, compares Python and SQL outputs to frozen expected
+    values, and tears down the temporary table.
 
-    The temporary table is ``ckid_u25_test_vectors`` (sqlite3) or
-    ``#ckid_u25_test_vectors`` (SQL Server via pyodbc).  Both are cleaned up
-    automatically after the harness completes.
+    Accepts sqlite3, pyodbc, or SQLAlchemy connections — see module docstring
+    for connection string examples.
     """
-    table = _TEMP_TABLE if not _is_sqlite(conn) else _TABLE
+    table = _table_name(conn)
+    db = _adapter(conn)
 
-    # Setup
-    _create_and_populate(conn, table)
+    # Create and populate
+    db.execute(f"""
+        CREATE TABLE {table} (
+            patient_id INTEGER,
+            lab_date   VARCHAR(10),
+            age_yr     FLOAT,
+            sex        VARCHAR(10),
+            height_cm  FLOAT,
+            scr_mgdl   FLOAT,
+            cysc_mgl   FLOAT
+        )
+    """)
+    db.executemany(
+        f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [(v.test_id, "2026-01-01", v.age_yr, v.sex,
+          v.height_cm, v.scr_mgdl, v.cysc_mgl) for v in TEST_VECTORS],
+    )
+    db.commit()
 
-    # SQL execution
-    sql_rows = _fetch_results(conn, table)
+    # Execute rendered SQL
+    sql = render_tsql_cte(source=table, egfr_threshold=None).rstrip().rstrip(";")
+    if _is_sqlite(conn):
+        sql = _translate_to_sqlite(sql)
+    rows = db.execute(sql).fetchall()
+    sql_rows: dict[int, Any] = {row[0]: row for row in rows}
 
-    # Tear down — ignore errors (temp tables drop with the connection anyway)
-    try:
-        if _is_sqlite(conn):
-            conn.execute(f"DROP TABLE IF EXISTS {table}")
-        else:
-            cur = conn.cursor()
-            cur.execute(f"IF OBJECT_ID('tempdb..{table}') IS NOT NULL DROP TABLE {table}")
-    except Exception:  # noqa: BLE001
-        pass
+    # Tear down
+    db.drop(table)
 
     # Build results
     results: list[HarnessRow] = []
@@ -224,7 +321,7 @@ def print_harness_report(results: list[HarnessRow]) -> None:
 
 
 def to_dataframe(results: list[HarnessRow]):  # type: ignore[return]
-    """Return results as a pandas DataFrame (requires ``pip install pandas``)."""
+    """Return results as a pandas DataFrame (requires ``uv add pandas``)."""
     try:
         import pandas as pd  # type: ignore[import-not-found]
     except ImportError as exc:

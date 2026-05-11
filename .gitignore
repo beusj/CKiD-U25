@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# macos
+.DS_Store
+
+# others
+**/*.log
+**/*.env
+**/*.csv
